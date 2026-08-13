@@ -1,0 +1,24 @@
+# Secrets & API keys
+config.yaml
+.env
+.env.*
+
+# Binary
+bin/
+*.exe
+
+# Database
+data/
+
+# Go
+*.test
+*.out
+*.prof
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
