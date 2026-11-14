@@ -25,28 +25,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// Pre-allocated order body pool to reduce GC pressure
-var orderBodyPool = sync.Pool{
-	New: func() any {
-		return &orderBody{}
-	},
-}
-
-type orderBody struct {
-	InstID  string `json:"instId"`
-	TdMode  string `json:"tdMode"`
-	Side    string `json:"side"`
-	PosSide string `json:"posSide"`
-	OrdType string `json:"ordType"`
-	Sz      string `json:"sz"`
-}
-
-type orderRequest struct {
-	ID   string      `json:"id"`
-	Op   string      `json:"op"`
-	Args []orderBody `json:"args"`
-}
-
 type Client struct {
 	cfg    config.ExchangeConfig
 	bot    config.BotConfig
@@ -60,7 +38,6 @@ type Client struct {
 	conn        *websocket.Conn
 	privateConn *websocket.Conn
 	privateMu   sync.Mutex
-	orderCh     chan []byte
 	orderResp   map[string]chan orderResult
 
 	timeOffset int64
@@ -69,7 +46,6 @@ type Client struct {
 type orderResult struct {
 	OrderID string
 	Error   error
-	Done    chan struct{}
 }
 
 type localBook struct {
@@ -104,7 +80,6 @@ func New(cfg config.ExchangeConfig, logger *zap.Logger, botCfg ...config.BotConf
 		books:  make(map[string]*localBook),
 	}
 	c.syncTime()
-	c.orderCh = make(chan []byte, 100)
 	c.orderResp = make(map[string]chan orderResult)
 	go c.connectPrivateWS()
 	return c
@@ -225,8 +200,6 @@ func (c *Client) handlePrivateMessage(raw []byte) {
 		}
 	}
 }
-
-func (c *Client) Name() string { return "okx" }
 
 func (c *Client) syncTime() {
 	resp, err := c.resty.R().Get("/api/v5/public/time")
@@ -603,36 +576,6 @@ func (c *Client) placeOrderREST(ctx context.Context, symbol, side, posSide, sz s
 		return "", fmt.Errorf("okx order error: %s %s", result[0].SCode, result[0].SMsg)
 	}
 	return result[0].OrdID, nil
-}
-
-func (c *Client) CancelOrder(ctx context.Context, symbol, orderID string) error {
-	body := map[string]any{"instId": symbol, "ordId": orderID}
-	return c.privateJSON(ctx, http.MethodPost, "/api/v5/trade/cancel-order", nil, body, nil)
-}
-
-func (c *Client) GetBalance(ctx context.Context, asset string) (decimal.Decimal, error) {
-	var result []struct {
-		Details []struct {
-			Ccy     string `json:"ccy"`
-			Eq      string `json:"eq"`
-			AvailEq string `json:"availEq"`
-		} `json:"details"`
-	}
-	if err := c.privateJSON(ctx, http.MethodGet, "/api/v5/account/balance", nil, nil, &result); err != nil {
-		return decimal.Zero, err
-	}
-	for _, acct := range result {
-		for _, d := range acct.Details {
-			if d.Ccy == asset {
-				value, err := decimal.NewFromString(d.Eq)
-				if err != nil {
-					return decimal.Zero, fmt.Errorf("parse okx balance: %w", err)
-				}
-				return value, nil
-			}
-		}
-	}
-	return decimal.Zero, nil
 }
 
 func (c *Client) SetLeverage(ctx context.Context, symbol string, leverage int) error {

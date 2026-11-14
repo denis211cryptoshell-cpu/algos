@@ -27,7 +27,7 @@ func TestPaperManagerOpenAndCloseByTakeProfit(t *testing.T) {
 	}()
 	cfg := &config.Config{Bot: config.BotConfig{TradingMode: "paper", MaxLeverage: 3, TPPercent: decimal.NewFromInt(4), SLPercent: decimal.RequireFromString("1.5"), MaxPositionSeconds: 20, KillSwitchLosses: 3}}
 	m := NewManager(cfg, nil, risk.NewManager(cfg.Bot), store, monitor.NoopNotifier{}, zaptest.NewLogger(t))
-	signal := model.Signal{Action: model.SignalEnterLong, Exchange: "bybit", Symbol: "BTCUSDT", EntryPrice: decimal.NewFromInt(100), Quantity: decimal.NewFromInt(1), CreatedAt: time.Now().UTC()}
+	signal := model.Signal{Action: model.SignalEnterLong, Exchange: "okx", Symbol: "BTCUSDT", EntryPrice: decimal.NewFromInt(100), Quantity: decimal.NewFromInt(1), CreatedAt: time.Now().UTC()}
 	pos, err := m.OpenFromSignal(context.Background(), signal)
 	if err != nil {
 		t.Fatalf("open from signal: %v", err)

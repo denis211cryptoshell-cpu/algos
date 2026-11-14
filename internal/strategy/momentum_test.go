@@ -14,7 +14,7 @@ func TestMomentumStrategyEnterLong(t *testing.T) {
 	now := time.Now().UTC()
 	s := NewMomentumStrategy(defaultStrategyConfig())
 	signal := s.Evaluate(model.MarketSnapshot{
-		Exchange:     "bybit",
+		Exchange:     "okx",
 		Symbol:       "NEWUSDT",
 		OpeningPrice: d("1"),
 		LastPrice:    d("1"),
@@ -45,7 +45,7 @@ func TestMomentumStrategyEnterShort(t *testing.T) {
 	cfg.DEXFairPrice = d("1")
 	s := NewMomentumStrategy(cfg)
 	signal := s.Evaluate(model.MarketSnapshot{
-		Exchange:     "bybit",
+		Exchange:     "okx",
 		Symbol:       "NEWUSDT",
 		OpeningPrice: d("2.5"),
 		LastPrice:    d("2.5"),
@@ -70,7 +70,7 @@ func TestMomentumStrategyHoldOutsideOpeningWindow(t *testing.T) {
 	now := time.Now().UTC()
 	s := NewMomentumStrategy(defaultStrategyConfig())
 	signal := s.Evaluate(model.MarketSnapshot{
-		Exchange:    "bybit",
+		Exchange:    "okx",
 		Symbol:      "NEWUSDT",
 		LastPrice:   d("1"),
 		ListingTime: now.Add(-4 * time.Second),

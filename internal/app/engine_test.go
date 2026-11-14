@@ -49,12 +49,12 @@ func TestFullPipeline_SignalToClose(t *testing.T) {
 	engine := NewEngine(cfg, riskManager, orderManager, zaptest.NewLogger(t))
 
 	listingTime := time.Now().UTC()
-	engine.RegisterListing("bybit", "TESTUSDT", listingTime, decimal.NewFromInt(1))
+	engine.RegisterListing("okx", "TESTUSDT", listingTime, decimal.NewFromInt(1))
 
 	// Simulate incoming trades: heavy buy pressure
 	for i := 0; i < 10; i++ {
 		engine.OnTrade(model.Trade{
-			Exchange:  "bybit",
+			Exchange:  "okx",
 			Symbol:    "TESTUSDT",
 			Side:      model.SideBuy,
 			Price:     decimal.NewFromInt(1),
@@ -65,7 +65,7 @@ func TestFullPipeline_SignalToClose(t *testing.T) {
 
 	// Simulate orderbook with bid dominance
 	engine.OnOrderbook(model.Orderbook{
-		Exchange: "bybit",
+		Exchange: "okx",
 		Symbol:   "TESTUSDT",
 		Bids: []model.OrderbookLevel{
 			{Price: decimal.NewFromInt(1), Quantity: decimal.NewFromInt(10000)},

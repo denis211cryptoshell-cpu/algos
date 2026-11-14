@@ -1,28 +1,10 @@
 package model
 
 import (
-	"sync"
 	"time"
 
 	"github.com/shopspring/decimal"
 )
-
-var (
-	snapshotPool  = sync.Pool{New: func() any { return &MarketSnapshot{} }}
-	signalPool    = sync.Pool{New: func() any { return &Signal{} }}
-	orderbookPool = sync.Pool{New: func() any { return &Orderbook{} }}
-)
-
-func AcquireSnapshot() *MarketSnapshot { return snapshotPool.Get().(*MarketSnapshot) }
-func ReleaseSnapshot(s *MarketSnapshot) {
-	s.Trades = s.Trades[:0]
-	s.Orderbooks = s.Orderbooks[:0]
-	snapshotPool.Put(s)
-}
-func AcquireSignal() *Signal        { return signalPool.Get().(*Signal) }
-func ReleaseSignal(s *Signal)       { signalPool.Put(s) }
-func AcquireOrderbook() *Orderbook  { return orderbookPool.Get().(*Orderbook) }
-func ReleaseOrderbook(o *Orderbook) { o.Bids = o.Bids[:0]; o.Asks = o.Asks[:0]; orderbookPool.Put(o) }
 
 type Side string
 

@@ -14,7 +14,6 @@ import (
 	"algos/internal/config"
 	"algos/internal/dex"
 	"algos/internal/exchange"
-	"algos/internal/exchange/bybit"
 	"algos/internal/exchange/okx"
 	"algos/internal/model"
 	"algos/internal/monitor"
@@ -30,7 +29,7 @@ func main() {
 	configPath := flag.String("config", "config.yaml", "path to YAML config")
 	symbolsFlag := flag.String("symbols", "", "comma-separated symbols to subscribe, e.g. BTCUSDT,ETHUSDT")
 	listingFlag := flag.String("listing", "", "optional listing definition SYMBOL:OPEN_PRICE, e.g. NEWUSDT:1.23")
-	autoDetect := flag.Bool("auto", false, "auto-detect new listings on Bybit")
+	autoDetect := flag.Bool("auto", false, "auto-detect new listings on OKX")
 	dexMonitor := flag.Bool("dex", false, "enable DEX monitoring for pre-listing detection")
 	testOrder := flag.String("test-order", "", "place a test market order SYMBOL:SIDE (buy/sell), e.g. BTCUSDT:buy")
 	flag.Parse()
@@ -64,17 +63,13 @@ func main() {
 	var client exchange.Client
 	var exchangeName string
 
-	// Try OKX first, then Bybit
+	// OKX is the only supported exchange
 	if okxCfg, ok := cfg.Exchanges["okx"]; ok && okxCfg.Enabled {
 		client = okx.New(okxCfg, logger, cfg.Bot)
 		exchangeName = "okx"
 		logger.Info("using OKX exchange")
-	} else if bybitCfg, ok := cfg.Exchanges["bybit"]; ok && bybitCfg.Enabled {
-		client = bybit.New(bybitCfg, logger, cfg.Bot)
-		exchangeName = "bybit"
-		logger.Info("using Bybit exchange")
 	} else {
-		logger.Fatal("no exchange enabled")
+		logger.Fatal("no exchange enabled: set exchanges.okx.enabled=true")
 	}
 
 	orderManager := order.NewManager(cfg, client, riskManager, store, notifier, logger)
@@ -82,7 +77,7 @@ func main() {
 	go orderManager.RunMonitor(ctx)
 
 	if *testOrder != "" {
-		placeTestOrder(ctx, client, *testOrder, logger)
+		placeTestOrder(ctx, client, exchangeName, *testOrder, logger)
 		return
 	}
 
@@ -204,7 +199,7 @@ func appendUnique(slice []string, s string) []string {
 	return append(slice, s)
 }
 
-func placeTestOrder(ctx context.Context, client exchange.Client, value string, logger *zap.Logger) {
+func placeTestOrder(ctx context.Context, client exchange.Client, exchangeName, value string, logger *zap.Logger) {
 	parts := strings.SplitN(value, ":", 2)
 	if len(parts) != 2 {
 		logger.Fatal("test-order format: SYMBOL:SIDE (buy/sell)", zap.String("value", value))
@@ -228,7 +223,7 @@ func placeTestOrder(ctx context.Context, client exchange.Client, value string, l
 	qty := decimal.RequireFromString("0.01")
 	pos := &model.Position{
 		ID:         fmt.Sprintf("test-%s-%d", symbol, time.Now().UnixNano()),
-		Exchange:   "bybit",
+		Exchange:   exchangeName,
 		Symbol:     symbol,
 		Side:       side,
 		EntryPrice: price,
@@ -240,7 +235,7 @@ func placeTestOrder(ctx context.Context, client exchange.Client, value string, l
 		logger.Fatal("place test order", zap.Error(err))
 	}
 	logger.Info("TEST ORDER PLACED", zap.String("orderID", orderID), zap.String("symbol", symbol), zap.String("side", string(side)), zap.String("qty", qty.String()))
-	logger.Info("CHECK BYBIT TESTNET - you should see the order in your account!")
+	logger.Info("check your exchange account — you should see the order there", zap.String("exchange", exchangeName))
 
 	<-ctx.Done()
 }

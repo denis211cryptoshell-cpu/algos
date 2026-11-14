@@ -3,6 +3,7 @@ module algos
 go 1.22
 
 require (
+	github.com/bytedance/sonic v1.15.2
 	github.com/go-resty/resty/v2 v2.15.3
 	github.com/go-telegram/bot v1.14.0
 	github.com/gorilla/websocket v1.5.3
@@ -14,7 +15,6 @@ require (
 
 require (
 	github.com/bytedance/gopkg v0.1.3 // indirect
-	github.com/bytedance/sonic v1.15.2 // indirect
 	github.com/bytedance/sonic/loader v0.5.1 // indirect
 	github.com/cloudwego/base64x v0.1.6 // indirect
 	github.com/fsnotify/fsnotify v1.7.0 // indirect
