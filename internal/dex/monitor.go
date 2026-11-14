@@ -42,7 +42,7 @@ type dexScreenerResponse struct {
 			Name    string `json:"name"`
 			Symbol  string `json:"symbol"`
 		} `json:"baseToken"`
-		ChainID string  `json:"chainId"`
+		ChainID  string  `json:"chainId"`
 		PriceUsd float64 `json:"priceUsd"`
 		Volume   struct {
 			H1  float64 `json:"h1"`
@@ -187,11 +187,11 @@ func (m *Monitor) getTopBoosted(ctx context.Context) ([]Token, error) {
 			score = 1
 		}
 		tokens = append(tokens, Token{
-			Symbol:    extractSymbol(b.Description),
-			Chain:     b.ChainID,
-			Address:   b.TokenAddress,
-			Score:     score,
-			Name:      b.Description,
+			Symbol:  extractSymbol(b.Description),
+			Chain:   b.ChainID,
+			Address: b.TokenAddress,
+			Score:   score,
+			Name:    b.Description,
 		})
 	}
 
@@ -245,7 +245,7 @@ func (m *Monitor) calculateScore(pair struct {
 		Name    string `json:"name"`
 		Symbol  string `json:"symbol"`
 	} `json:"baseToken"`
-	ChainID string  `json:"chainId"`
+	ChainID  string  `json:"chainId"`
 	PriceUsd float64 `json:"priceUsd"`
 	Volume   struct {
 		H1  float64 `json:"h1"`

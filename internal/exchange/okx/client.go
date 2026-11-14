@@ -56,12 +56,12 @@ type Client struct {
 	bookMu sync.Mutex
 	books  map[string]*localBook
 
-	connMu     sync.Mutex
-	conn       *websocket.Conn
+	connMu      sync.Mutex
+	conn        *websocket.Conn
 	privateConn *websocket.Conn
-	privateMu  sync.Mutex
-	orderCh    chan []byte
-	orderResp  map[string]chan orderResult
+	privateMu   sync.Mutex
+	orderCh     chan []byte
+	orderResp   map[string]chan orderResult
 
 	timeOffset int64
 }
@@ -153,10 +153,10 @@ func (c *Client) wsLogin(conn *websocket.Conn) error {
 	loginMsg := map[string]any{
 		"op": "login",
 		"args": []map[string]string{{
-			"apiKey":      c.cfg.APIKey,
-			"passphrase":  c.cfg.Passphrase,
-			"timestamp":   timestamp,
-			"sign":        sig,
+			"apiKey":     c.cfg.APIKey,
+			"passphrase": c.cfg.Passphrase,
+			"timestamp":  timestamp,
+			"sign":       sig,
 		}},
 	}
 	return conn.WriteJSON(loginMsg)
@@ -177,18 +177,18 @@ func (c *Client) readPrivateWS(conn *websocket.Conn) {
 
 func (c *Client) handlePrivateMessage(raw []byte) {
 	var msg struct {
-		Op      string          `json:"op"`
+		Op      string                   `json:"op"`
 		Arg     struct{ Channel string } `json:"arg"`
-		Data    json.RawMessage `json:"data"`
-		Event   string          `json:"event"`
-		Msg     string          `json:"msg"`
-		Code    string          `json:"code"`
-		ReqID   string          `json:"reqId"`
-		ID      string          `json:"id"`
-		ClOrdID string          `json:"clOrdId"`
-		OrdID   string          `json:"ordId"`
-		SCode   string          `json:"sCode"`
-		SMsg    string          `json:"sMsg"`
+		Data    json.RawMessage          `json:"data"`
+		Event   string                   `json:"event"`
+		Msg     string                   `json:"msg"`
+		Code    string                   `json:"code"`
+		ReqID   string                   `json:"reqId"`
+		ID      string                   `json:"id"`
+		ClOrdID string                   `json:"clOrdId"`
+		OrdID   string                   `json:"ordId"`
+		SCode   string                   `json:"sCode"`
+		SMsg    string                   `json:"sMsg"`
 	}
 	if err := json.Unmarshal(raw, &msg); err != nil {
 		return
@@ -589,9 +589,9 @@ func (c *Client) placeOrderREST(ctx context.Context, symbol, side, posSide, sz s
 		"sz":      sz,
 	}
 	var result []struct {
-		OrdID  string `json:"ordId"`
-		SCode  string `json:"sCode"`
-		SMsg   string `json:"sMsg"`
+		OrdID string `json:"ordId"`
+		SCode string `json:"sCode"`
+		SMsg  string `json:"sMsg"`
 	}
 	if err := c.privateJSON(ctx, http.MethodPost, "/api/v5/trade/order", nil, body, &result); err != nil {
 		return "", err
@@ -613,8 +613,8 @@ func (c *Client) CancelOrder(ctx context.Context, symbol, orderID string) error 
 func (c *Client) GetBalance(ctx context.Context, asset string) (decimal.Decimal, error) {
 	var result []struct {
 		Details []struct {
-			Ccy    string `json:"ccy"`
-			Eq     string `json:"eq"`
+			Ccy     string `json:"ccy"`
+			Eq      string `json:"eq"`
 			AvailEq string `json:"availEq"`
 		} `json:"details"`
 	}
