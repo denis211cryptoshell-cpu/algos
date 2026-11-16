@@ -1,286 +1,221 @@
-# ALGOS — Listing Sniper Bot
+# ALGOS — Listing Sniper Bot (OKX)
 
-Высокочастотный торговый бот для автоматического входа при листинге новых токенов на CEX биржах (OKX, Bybit).
+Снайпер-бот для входа в момент листинга токенов на OKX (USDT-перпетуалы). Решение принимается по данным публичного WebSocket, вход — market-ордер через WebSocket (mainnet) с REST-фолбэком, выход по TP/SL/таймауту на основе кэша цен из того же WS.
+
+## Режимы работы
+
+| Режим | Что делает |
+|-------|------------|
+| `bot.mode: testnet` | OKX demo (simulated trading): `x-simulated-trading: 1`, `wspap.okx.com` |
+| `bot.mode: mainnet` | Реальная торговля: `ws.okx.com`, заголовок simulated не отправляется |
+| `bot.trading_mode: paper` | Сигналы и позиции считаются виртуально, ордера на биржу не отправляются |
+| `bot.trading_mode: live` | Реальные ордера. Для `mainnet + live` обязателен флаг `-confirm-prod` |
 
 ## Архитектура
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    DEX Monitor (DexScreener)                │
-│  Мониторит DEX на предмет аномальной активности            │
-│  Volume spike + Price pump + Buy pressure → Score           │
-└────────────────────────────┬────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   Listing Detector                          │
-│  Каждые 10 сек проверяет OKX на новые токены               │
-│  При обнаружении → автоматическая подписка на WS           │
-└────────────────────────────┬────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────┐
-│                  OKX WebSocket (public)                     │
-│  Tickers + Orderbook (200 уровней) в реальном времени      │
-└────────────────────────────┬────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   Strategy Engine                           │
-│  Momentum: Buy/Sell ratio + Bid/Ask imbalance              │
-│  Opening window: 3 секунды после листинга                  │
-└────────────────────────────┬────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   Order Manager                             │
-│  OKX REST API → Market orders (cross margin)               │
-│  Auto TP/SL + Max hold 20 сек + Kill switch                │
-└────────────────────────────┬────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   Risk Manager                              │
-│  TP +4% / SL -1.5% / Max lifetime 20s / Kill after 3 loss │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│ DEX Monitor (DexScreener)                                     │
+│ Volume spike + Price pump + Buy pressure → score              │
+│ Сейчас только логирует кандидатов (в торговлю не подключён)   │
+└──────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────┐
+│ Listing Detector (OKX REST, опрос каждые 10 с)                │
+│ Новые USDT-SWAP → RegisterListing + подписка на WS            │
+│ + прогрев инструмента (lotSz/minSz, плечо)                    │
+└──────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────┐
+│ OKX public WebSocket                                          │
+│ tickers (last price, side) + books5 (5 уровней стакана)       │
+└──────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────┐
+│ Engine                                                        │
+│ Снапшоты рынка, дедуп входа, кэш цен для мониторинга позиции  │
+└──────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────┐
+│ Strategy (momentum)                                           │
+│ Buy/Sell notional + Bid/Ask imbalance в окне открытия         │
+└──────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────┐
+│ Order Manager                                                 │
+│ WS market-ордер (REST fallback, идемпотентный clOrdId),       │
+│ виртуальный TP/SL + max lifetime, paper-режим, метрики        │
+└──────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────┐
+│ Risk Manager                                                  │
+│ TP/SL, max lifetime, kill switch после N убытков подряд       │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ## Компоненты
 
 | Модуль | Файл | Назначение |
 |--------|------|------------|
-| **OKX Client** | `internal/exchange/okx/client.go` | REST API + WebSocket, авторизация, time sync |
-| **Bybit Client** | `internal/exchange/bybit/client.go` | REST API + WebSocket (заблокирован регуляторно) |
-| **DEX Monitor** | `internal/dex/monitor.go` | Мониторинг DexScreener API, scoring токенов |
-| **Strategy** | `internal/strategy/momentum.go` | Momentum стратегия для листингов |
-| **Order Manager** | `internal/order/manager.go` | Жизненный цикл позиций, paper/live mode |
-| **Risk Manager** | `internal/risk/manager.go` | TP/SL, kill switch, контроль убытков |
-| **Engine** | `internal/app/engine.go` | Центральный координатор, обработка событий |
-| **Storage** | `internal/storage/bolt.go` | BoltDB для хранения сделок и позиций |
-| **Config** | `internal/config/config.go` | YAML конфигурация с валидацией |
+| OKX client | `internal/exchange/okx/client.go` | REST + WebSocket, авторизация, синхронизация времени, кэш инструментов, WS-ордера |
+| Engine | `internal/app/engine.go` | Координатор, снапшоты, защита от повторного входа (`MarkEntered`) |
+| Strategy | `internal/strategy/momentum.go` | Momentum-стратегия для листингов |
+| Order manager | `internal/order/manager.go` | Жизненный цикл позиции, paper/live, восстановление, метрики латентности |
+| Risk manager | `internal/risk/manager.go` | TP/SL, max lifetime, kill switch |
+| DEX monitor | `internal/dex/monitor.go` | DexScreener scoring (только логирование) |
+| Storage | `internal/storage/bolt.go` | BoltDB: позиции, сделки, сигналы; загрузка открытых позиций при старте |
+| Config | `internal/config/config.go` | YAML-конфигурация с валидацией |
+| Telegram | `internal/monitor/telegram.go` | Уведомления |
 
-## Установка
-
-```bash
-git clone <repo>
-cd algos
-go mod download
-go build ./...
-```
-
-## Запуск
-
-### Полный режим (DEX монитор + авто-детект OKX)
+## Быстрый старт
 
 ```bash
-go run ./cmd/algos -config config.yaml -auto -dex
+make build
+
+# конфиги (не коммитятся):
+# config.example.yaml — шаблон
+# config.testnet.yaml — demo-ключи, data/testnet/trades.db
+# config.prod.yaml    — боевые ключи, data/prod/trades.db
+cp config.example.yaml config.testnet.yaml   # заполнить API-ключи demo
+
+make run-testnet
 ```
 
-Бот запускается в режиме ожидания:
-- DEX монитор проверяет DexScreener каждые 60 сек
-- Listing detector проверяет OKX каждые 10 сек
-- При обнаружении нового токена — автоматически подключается и торгует
-
-### С конкретным символом
+Запуск напрямую:
 
 ```bash
-go run ./cmd/algos -config config.yaml -symbols BTC-USDT-SWAP
+go run ./cmd/algos -config config.testnet.yaml -auto -dex
+go run ./cmd/algos -config config.testnet.yaml -symbols BTC-USDT-SWAP
+go run ./cmd/algos -config config.testnet.yaml -listing BTC-USDT-SWAP:63000
+go run ./cmd/algos -config config.testnet.yaml -test-order BTC-USDT-SWAP:buy
 ```
 
-### С ручным листингом
+### Флаги
 
-```bash
-go run ./cmd/algos -config config.yaml -listing BTC-USDT-SWAP:63000
-```
-
-### Тест ордера
-
-```bash
-go run ./cmd/algos -config config.yaml -test-order BTC-USDT-SWAP:buy
-```
-
-## Конфигурация (config.yaml)
-
-```yaml
-bot:
-  mode: "testnet"              # testnet / mainnet
-  trading_mode: "live"         # paper / live
-  max_position_seconds: 20     # Максимальное удержание позиции
-  kill_switch_losses: 3        # Kill switch после N убытков
-  max_leverage: 3              # Максимальное кредитное плечо
-  tp_percent: 4.0              # Take profit %
-  sl_percent: 1.5              # Stop loss %
-  position_check_ms: 50        # Интервал проверки позиции (мс)
-  recv_window: "5000"          # OKX recv window (мс)
-
-exchanges:
-  okx:
-    enabled: true
-    api_key: "YOUR_KEY"
-    api_secret: "YOUR_SECRET"
-    passphrase: "YOUR_PASSPHRASE"
-    base_url: "https://www.okx.com"
-    ws_public: "wss://wspap.okx.com:8443/ws/v5/public?brokerId=9999"
-
-strategy:
-  imbalance_ratio: 1.3         # Минимальный Bid/Ask ratio
-  trade_velocity_ratio: 1.5    # Минимальный Buy/Sell ratio
-  opening_window_seconds: 3    # Окно входа после листинга
-  max_position_pct_liquidity: 10.0  # Размер позиции от ликвидности
-```
+| Флаг | Описание |
+|------|----------|
+| `-config` | путь к YAML (по умолчанию `config.yaml`) |
+| `-symbols` | список символов через запятую |
+| `-listing` | ручной листинг `SYMBOL:OPEN_PRICE` |
+| `-auto` | авто-детект новых листингов OKX |
+| `-dex` | включить DEX-монитор (логирование кандидатов) |
+| `-test-order` | проверочный market-ордер `SYMBOL:buy/sell` |
+| `-confirm-prod` | обязателен для `mainnet + live` |
 
 ## Торговая логика
 
-### Вход (LONG)
-Все условия должны быть выполнены в opening window (3 сек):
-- `BuyNotional / SellNotional >= 1.5` (покупатели доминируют)
-- `BidNotional / AskNotional >= 1.3` ( Bid стена толще Ask)
-- `OpeningPrice <= DEXFairPrice` (если DEX фильтр включён)
+Вход LONG (все условия в окне `opening_window_seconds`):
 
-### Вход (SHORT)
-- `SellNotional / BuyNotional >= 1.5` (продавцы доминируют)
-- `AskNotional / BidNotional >= 1.3` (Ask стена толще Bid)
-- `OpeningPrice >= DEXFairPrice * 2.5` (перекупленность)
+- `BuyNotional / SellNotional >= trade_velocity_ratio`
+- `BidNotional / AskNotional >= imbalance_ratio`
+- ликвидность Ask >= `min_liquidity_notional` (если задано)
+- `OpeningPrice <= DEXFairPrice` (если включён `dex_fair_price_enabled`)
 
-### Выход
-Первое срабатывание:
-- **Take Profit:** +4% от входа
-- **Stop Loss:** -1.5% от входа
-- **Max Lifetime:** 20 секунд
-- **Manual:** при shutdown
+Вход SHORT — зеркально, плюс `OpeningPrice >= DEXFairPrice * short_overprice_multiplier`.
 
-### Kill Switch
-После 3 убытков подряд — полная блокировка торговли до ручного сброса.
+Выход (первое событие):
 
-## DEX Monitor
+- Take Profit: `+tp_percent`
+- Stop Loss: `-sl_percent`
+- Max lifetime: `max_position_seconds`
+- Ручное закрытие при shutdown
 
-Мониторит DexScreener API для раннего обнаружения токенов перед листингом на CEX.
+TP/SL виртуальные: позиция проверяется каждые `position_check_ms` по цене из WS-кэша (REST mark price — только если WS-цены ещё нет). Закрытие на бирже — reduce-only market-ордер (корректно для hedge-режима).
 
-### Сигналы
-| Сигнал | Формула | Порог |
-|--------|---------|-------|
-| Volume spike | h1_volume / (h24_volume / 24) | > 2x |
-| Price pump | h1_price_change | > 50% |
-| Buy pressure | buys / sells | > 1.5 |
-| Liquidity | liquidity_usd | > $10k |
+Kill switch: после `kill_switch_losses` убытков подряд торговля блокируется до рестарта.
 
-### Scoring
-- Volume spike x2 → +0.3
-- Volume spike x5 → +0.2
-- Price pump > 50% → +0.3
-- Buy ratio > 1.5 → +0.2
-- Liquidity > $10k → +0.1
-- Liquidity > $50k → +0.1
+## Восстановление после рестарта
 
-Score > 0.5 → кандидат на листинг.
+Открытая позиция сохраняется в BoltDB. При старте бот:
 
-## Производительность
+1. загружает открытую позицию (`LoadOpenPositions`);
+2. восстанавливает её мониторинг (TP/SL/таймаут продолжают работать);
+3. помечает рынок как уже отработанный, чтобы не открыть вторую позицию;
+4. отправляет уведомление в Telegram.
 
-| Метрика | Значение |
-|---------|----------|
-| REST API ping | ~317ms |
-| Opening window | 3 сек |
-| Запас времени | ~2.7 сек |
-| DEX Monitor CPU | +0.05% |
-| DEX Monitor память | +150 KB |
-| DEX Monitor сеть | 70 KB/мин |
+Если в базе больше одной открытой позиции, восстанавливается только первая — остальные требуют ручного закрытия (бот держит одну позицию).
+
+## Латентность
+
+В логах на каждый ордер пишутся `decision_latency` (сигнал → отправка) и `place_latency` (отправка → подтверждение), а каждые 25 ордеров — p50/p95 по обоим метрикам.
+
+## Производительность и ограничения
+
+- используется `books5` — 5 уровней стакана (не 200);
+- горячий путь не ходит в REST: правила инструмента и плечо прогреваются заранее (`PrepareSymbol`);
+- одновременно держится одна позиция;
+- DEX-монитор пока только логирует кандидатов;
+- для минимальной задержки нужен VPS рядом с OKX (Токио/Сингапур/Гонконг).
+
+## Тесты
+
+```bash
+make test        # go test ./...
+make vet         # go vet ./...
+make fmt         # gofmt -w .
+```
+
+Покрыты: momentum-стратегия, риск-менеджер, paper-выход по TP через монитор позиции, восстановление позиции из BoltDB.
 
 ## Деплой на VPS
 
-### Требования
-- Ubuntu 22.04+
-- Go 1.22+
-- VPS рядом с OKX (Токио/Сингапур/Гонконг)
-
-### Установка
 ```bash
-# На VPS
 sudo apt update && sudo apt install -y golang-go
-git clone <repo>
-cd algos
-go build -o algos ./cmd/algos
+git clone <repo> /opt/algos && cd /opt/algos
+make build
 
-# Запуск
-nohup ./algos -config config.yaml -auto -dex > bot.log 2>&1 &
-```
+# конфиги
+cp config.example.yaml config.testnet.yaml
+cp config.example.yaml config.prod.yaml   # затем выставить mode: mainnet
 
-### Мониторинг
-```bash
-# Просмотр логов
-tail -f bot.log
-
-# Проверка процесса
-ps aux | grep algos
-
-# Остановка
-pkill algos
-```
-
-## Тестирование
-
-### Запуск тестов
-```bash
-go test ./... -v
-```
-
-### Тест на testnet
-1. Создайте API ключи на testnet.okx.com
-2. Вставьте в config.yaml
-3. Запустите: `go run ./cmd/algos -config config.yaml -auto -dex`
-
-### Проверка баланса
-```bash
-go run ./cmd/algos -config config.yaml -test-order BTC-USDT-SWAP:buy
-```
-
-## Структура проекта
-
-```
-algos/
-├── cmd/
-│   └── algos/
-│       └── main.go              # Точка входа
-├── internal/
-│   ├── app/
-│   │   └── engine.go            # Центральный координатор
-│   ├── config/
-│   │   └── config.go            # Конфигурация
-│   ├── dex/
-│   │   └── monitor.go           # DEX монитор (DexScreener)
-│   ├── exchange/
-│   │   ├── exchange.go          # Интерфейс биржи
-│   │   ├── bybit/
-│   │   │   └── client.go        # Bybit клиент
-│   │   └── okx/
-│   │       └── client.go        # OKX клиент
-│   ├── model/
-│   │   └── types.go             # Доменные типы
-│   ├── monitor/
-│   │   └── telegram.go          # Telegram уведомления
-│   ├── order/
-│   │   └── manager.go           # Управление ордерами
-│   ├── risk/
-│   │   └── manager.go           # Риск-менеджмент
-│   └── storage/
-│       └── bolt.go              # BoltDB хранилище
-├── config.yaml                  # Конфигурация
-├── go.mod                       # Go модули
-├── go.sum                       # Зависимости
-└── Makefile                     # Команды сборки
+# systemd
+sudo cp deploy/algos-testnet.service /etc/systemd/system/
+sudo cp deploy/algos-prod.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now algos-testnet
+# боевой бот — только после проверки на demo:
+# sudo systemctl enable --now algos-prod
 ```
 
 ## Зависимости
 
 | Пакет | Версия | Назначение |
 |-------|--------|------------|
-| `bytedance/sonic` | v1.15.2 | Быстрый JSON |
-| `shopspring/decimal` | v1.4.0 | Точная арифметика |
-| `gorilla/websocket` | v1.5.3 | WebSocket клиент |
-| `go-resty/resty` | v2.15.3 | HTTP клиент |
-| `go-telegram/bot` | v1.14.0 | Telegram бот |
-| `spf13/viper` | v1.19.0 | YAML конфигурация |
+| `github.com/bytedance/sonic` | v1.15.2 | Быстрый JSON |
+| `github.com/go-resty/resty/v2` | v2.15.3 | HTTP-клиент |
+| `github.com/gorilla/websocket` | v1.5.3 | WebSocket |
+| `github.com/shopspring/decimal` | v1.4.0 | Точная арифметика |
+| `github.com/spf13/viper` | v1.19.0 | YAML-конфигурация |
 | `go.etcd.io/bbolt` | v1.3.11 | Key-value хранилище |
 | `go.uber.org/zap` | v1.27.0 | Структурированные логи |
+| `github.com/go-telegram/bot` | v1.14.0 | Telegram-уведомления |
+
+## Структура проекта
+
+```
+algos/
+├── cmd/algos/main.go
+├── internal/
+│   ├── app/engine.go
+│   ├── config/config.go
+│   ├── dex/monitor.go
+│   ├── exchange/
+│   │   ├── exchange.go
+│   │   └── okx/client.go
+│   ├── model/types.go
+│   ├── monitor/telegram.go
+│   ├── order/manager.go
+│   ├── risk/manager.go
+│   ├── storage/bolt.go
+│   └── strategy/momentum.go
+├── deploy/
+│   ├── algos-testnet.service
+│   └── algos-prod.service
+├── config.example.yaml
+├── Makefile
+├── go.mod
+└── go.sum
+```
 
 ## Лицензия
 
