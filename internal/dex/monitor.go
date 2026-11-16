@@ -2,11 +2,9 @@ package dex
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net/http"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -42,7 +40,7 @@ type dexScreenerResponse struct {
 			Name    string `json:"name"`
 			Symbol  string `json:"symbol"`
 		} `json:"baseToken"`
-		ChainID string  `json:"chainId"`
+		ChainID  string  `json:"chainId"`
 		PriceUsd float64 `json:"priceUsd"`
 		Volume   struct {
 			H1  float64 `json:"h1"`
@@ -187,11 +185,11 @@ func (m *Monitor) getTopBoosted(ctx context.Context) ([]Token, error) {
 			score = 1
 		}
 		tokens = append(tokens, Token{
-			Symbol:    extractSymbol(b.Description),
-			Chain:     b.ChainID,
-			Address:   b.TokenAddress,
-			Score:     score,
-			Name:      b.Description,
+			Symbol:  extractSymbol(b.Description),
+			Chain:   b.ChainID,
+			Address: b.TokenAddress,
+			Score:   score,
+			Name:    b.Description,
 		})
 	}
 
@@ -245,7 +243,7 @@ func (m *Monitor) calculateScore(pair struct {
 		Name    string `json:"name"`
 		Symbol  string `json:"symbol"`
 	} `json:"baseToken"`
-	ChainID string  `json:"chainId"`
+	ChainID  string  `json:"chainId"`
 	PriceUsd float64 `json:"priceUsd"`
 	Volume   struct {
 		H1  float64 `json:"h1"`
@@ -308,23 +306,4 @@ func extractSymbol(description string) string {
 		return description[:20]
 	}
 	return description
-}
-
-func containsAny(s string, substrs []string) bool {
-	for _, sub := range substrs {
-		if strings.Contains(strings.ToLower(s), strings.ToLower(sub)) {
-			return true
-		}
-	}
-	return false
-}
-
-func formatUSD(amount float64) string {
-	if amount >= 1000000 {
-		return fmt.Sprintf("$%.1fM", amount/1000000)
-	}
-	if amount >= 1000 {
-		return fmt.Sprintf("$%.1fK", amount/1000)
-	}
-	return fmt.Sprintf("$%.2f", amount)
 }

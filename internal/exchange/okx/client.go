@@ -25,28 +25,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// Pre-allocated order body pool to reduce GC pressure
-var orderBodyPool = sync.Pool{
-	New: func() any {
-		return &orderBody{}
-	},
-}
-
-type orderBody struct {
-	InstID  string `json:"instId"`
-	TdMode  string `json:"tdMode"`
-	Side    string `json:"side"`
-	PosSide string `json:"posSide"`
-	OrdType string `json:"ordType"`
-	Sz      string `json:"sz"`
-}
-
-type orderRequest struct {
-	ID   string      `json:"id"`
-	Op   string      `json:"op"`
-	Args []orderBody `json:"args"`
-}
-
 type Client struct {
 	cfg    config.ExchangeConfig
 	bot    config.BotConfig
@@ -56,20 +34,35 @@ type Client struct {
 	bookMu sync.Mutex
 	books  map[string]*localBook
 
-	connMu     sync.Mutex
-	conn       *websocket.Conn
+	connMu      sync.Mutex
+	conn        *websocket.Conn
 	privateConn *websocket.Conn
-	privateMu  sync.Mutex
-	orderCh    chan []byte
-	orderResp  map[string]chan orderResult
+	privateMu   sync.Mutex
+	orderResp   map[string]chan orderResult
 
+	instrumentsMu sync.Mutex
+	instruments   map[string]instrumentRule
+	prepared      map[string]int
+
+	simulated  bool
 	timeOffset int64
+}
+
+type instrumentRule struct {
+	LotSz decimal.Decimal
+	MinSz decimal.Decimal
+}
+
+func (r instrumentRule) roundQty(qty decimal.Decimal) decimal.Decimal {
+	if !r.LotSz.IsPositive() {
+		return qty
+	}
+	return qty.Div(r.LotSz).Floor().Mul(r.LotSz)
 }
 
 type orderResult struct {
 	OrderID string
 	Error   error
-	Done    chan struct{}
 }
 
 type localBook struct {
@@ -85,6 +78,25 @@ func New(cfg config.ExchangeConfig, logger *zap.Logger, botCfg ...config.BotConf
 	if bot.RecvWindow == "" {
 		bot.RecvWindow = "5000"
 	}
+	// Mode wiring: testnet = OKX demo (simulated trading), mainnet = real trading
+	simulated := bot.Mode != "mainnet"
+	if cfg.BaseURL == "" {
+		cfg.BaseURL = "https://www.okx.com"
+	}
+	if cfg.WSPublic == "" {
+		if simulated {
+			cfg.WSPublic = "wss://wspap.okx.com:8443/ws/v5/public?brokerId=9999"
+		} else {
+			cfg.WSPublic = "wss://ws.okx.com:8443/ws/v5/public"
+		}
+	}
+	if cfg.WSPrivate == "" {
+		if simulated {
+			cfg.WSPrivate = "wss://wspap.okx.com:8443/ws/v5/private?brokerId=9999"
+		} else {
+			cfg.WSPrivate = "wss://ws.okx.com:8443/ws/v5/private"
+		}
+	}
 	// Optimized HTTP client with keep-alive and connection pooling
 	httpClient := &http.Client{
 		Timeout: 3 * time.Second,
@@ -97,14 +109,16 @@ func New(cfg config.ExchangeConfig, logger *zap.Logger, botCfg ...config.BotConf
 	}
 	restyClient := resty.NewWithClient(httpClient).SetBaseURL(cfg.BaseURL)
 	c := &Client{
-		cfg:    cfg,
-		bot:    bot,
-		resty:  restyClient,
-		logger: logger.Named("okx"),
-		books:  make(map[string]*localBook),
+		cfg:         cfg,
+		bot:         bot,
+		resty:       restyClient,
+		logger:      logger.Named("okx"),
+		books:       make(map[string]*localBook),
+		instruments: make(map[string]instrumentRule),
+		prepared:    make(map[string]int),
+		simulated:   simulated,
 	}
 	c.syncTime()
-	c.orderCh = make(chan []byte, 100)
 	c.orderResp = make(map[string]chan orderResult)
 	go c.connectPrivateWS()
 	return c
@@ -113,7 +127,8 @@ func New(cfg config.ExchangeConfig, logger *zap.Logger, botCfg ...config.BotConf
 func (c *Client) connectPrivateWS() {
 	wsURL := c.cfg.WSPrivate
 	if wsURL == "" {
-		wsURL = "wss://wspap.okx.com:8443/ws/v5/private?brokerId=9999"
+		c.logger.Error("okx private ws url is empty")
+		return
 	}
 
 	for {
@@ -137,9 +152,13 @@ func (c *Client) connectPrivateWS() {
 		}
 		c.logger.Info("okx private ws connected")
 
-		// Read loop
-		go c.readPrivateWS(conn)
-		return
+		c.readPrivateLoop(conn)
+
+		c.privateMu.Lock()
+		c.privateConn = nil
+		c.privateMu.Unlock()
+		c.logger.Warn("okx private ws disconnected, reconnecting")
+		time.Sleep(2 * time.Second)
 	}
 }
 
@@ -153,22 +172,39 @@ func (c *Client) wsLogin(conn *websocket.Conn) error {
 	loginMsg := map[string]any{
 		"op": "login",
 		"args": []map[string]string{{
-			"apiKey":      c.cfg.APIKey,
-			"passphrase":  c.cfg.Passphrase,
-			"timestamp":   timestamp,
-			"sign":        sig,
+			"apiKey":     c.cfg.APIKey,
+			"passphrase": c.cfg.Passphrase,
+			"timestamp":  timestamp,
+			"sign":       sig,
 		}},
 	}
 	return conn.WriteJSON(loginMsg)
 }
 
-func (c *Client) readPrivateWS(conn *websocket.Conn) {
+func (c *Client) readPrivateLoop(conn *websocket.Conn) {
 	defer conn.Close()
+
+	stopPing := make(chan struct{})
+	defer close(stopPing)
+	go func() {
+		ticker := time.NewTicker(25 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopPing:
+				return
+			case <-ticker.C:
+				if err := conn.WriteMessage(websocket.TextMessage, []byte("ping")); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
 	for {
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
 			c.logger.Warn("okx private ws read error", zap.Error(err))
-			go c.connectPrivateWS()
 			return
 		}
 		c.handlePrivateMessage(raw)
@@ -177,18 +213,18 @@ func (c *Client) readPrivateWS(conn *websocket.Conn) {
 
 func (c *Client) handlePrivateMessage(raw []byte) {
 	var msg struct {
-		Op      string          `json:"op"`
+		Op      string                   `json:"op"`
 		Arg     struct{ Channel string } `json:"arg"`
-		Data    json.RawMessage `json:"data"`
-		Event   string          `json:"event"`
-		Msg     string          `json:"msg"`
-		Code    string          `json:"code"`
-		ReqID   string          `json:"reqId"`
-		ID      string          `json:"id"`
-		ClOrdID string          `json:"clOrdId"`
-		OrdID   string          `json:"ordId"`
-		SCode   string          `json:"sCode"`
-		SMsg    string          `json:"sMsg"`
+		Data    json.RawMessage          `json:"data"`
+		Event   string                   `json:"event"`
+		Msg     string                   `json:"msg"`
+		Code    string                   `json:"code"`
+		ReqID   string                   `json:"reqId"`
+		ID      string                   `json:"id"`
+		ClOrdID string                   `json:"clOrdId"`
+		OrdID   string                   `json:"ordId"`
+		SCode   string                   `json:"sCode"`
+		SMsg    string                   `json:"sMsg"`
 	}
 	if err := json.Unmarshal(raw, &msg); err != nil {
 		return
@@ -219,14 +255,16 @@ func (c *Client) handlePrivateMessage(raw []byte) {
 					if o.SCode != "0" {
 						result.Error = fmt.Errorf("okx order error: %s %s", o.SCode, o.SMsg)
 					}
-					ch <- result
+					// Non-blocking: never stall the private WS read loop
+					select {
+					case ch <- result:
+					default:
+					}
 				}
 			}
 		}
 	}
 }
-
-func (c *Client) Name() string { return "okx" }
 
 func (c *Client) syncTime() {
 	resp, err := c.resty.R().Get("/api/v5/public/time")
@@ -513,6 +551,73 @@ func (c *Client) ListSymbols(ctx context.Context) ([]string, error) {
 	return symbols, nil
 }
 
+// PrepareSymbol pre-loads instrument rules and sets leverage once per symbol so
+// the order path stays free of extra REST round-trips.
+func (c *Client) PrepareSymbol(ctx context.Context, symbol string, leverage int) error {
+	c.instrumentsMu.Lock()
+	preparedLeverage, ok := c.prepared[symbol]
+	c.instrumentsMu.Unlock()
+	if ok && preparedLeverage == leverage {
+		return nil
+	}
+	if _, err := c.ensureRule(ctx, symbol); err != nil {
+		return err
+	}
+	if err := c.SetLeverage(ctx, symbol, leverage); err != nil {
+		return err
+	}
+	c.instrumentsMu.Lock()
+	c.prepared[symbol] = leverage
+	c.instrumentsMu.Unlock()
+	return nil
+}
+
+func (c *Client) ensureRule(ctx context.Context, symbol string) (instrumentRule, error) {
+	c.instrumentsMu.Lock()
+	rule, ok := c.instruments[symbol]
+	c.instrumentsMu.Unlock()
+	if ok {
+		return rule, nil
+	}
+
+	var result struct {
+		Data []struct {
+			InstID string `json:"instId"`
+			LotSz  string `json:"lotSz"`
+			MinSz  string `json:"minSz"`
+		} `json:"data"`
+	}
+	resp, err := c.resty.R().SetContext(ctx).
+		SetQueryParam("instType", "SWAP").
+		SetQueryParam("instId", symbol).
+		Get("/api/v5/public/instruments")
+	if err != nil {
+		return instrumentRule{}, fmt.Errorf("okx instruments: %w", err)
+	}
+	if err := sonic.Unmarshal(resp.Body(), &result); err != nil {
+		return instrumentRule{}, fmt.Errorf("okx parse instruments: %w", err)
+	}
+	if len(result.Data) == 0 {
+		return instrumentRule{}, fmt.Errorf("okx instrument not found: %s", symbol)
+	}
+	rule = instrumentRule{}
+	if result.Data[0].LotSz != "" {
+		if rule.LotSz, err = decimal.NewFromString(result.Data[0].LotSz); err != nil {
+			return instrumentRule{}, fmt.Errorf("okx parse lotSz: %w", err)
+		}
+	}
+	if result.Data[0].MinSz != "" {
+		if rule.MinSz, err = decimal.NewFromString(result.Data[0].MinSz); err != nil {
+			return instrumentRule{}, fmt.Errorf("okx parse minSz: %w", err)
+		}
+	}
+
+	c.instrumentsMu.Lock()
+	c.instruments[symbol] = rule
+	c.instrumentsMu.Unlock()
+	return rule, nil
+}
+
 func (c *Client) PlaceOrder(ctx context.Context, pos *model.Position) (string, error) {
 	if pos == nil {
 		return "", fmt.Errorf("position is nil")
@@ -524,22 +629,48 @@ func (c *Client) PlaceOrder(ctx context.Context, pos *model.Position) (string, e
 		posSide = "short"
 	}
 
-	// Use REST (WS orders not supported on demo)
-	return c.placeOrderREST(ctx, pos.Symbol, side, posSide, pos.Quantity.String())
+	rule, err := c.ensureRule(ctx, pos.Symbol)
+	if err != nil {
+		return "", err
+	}
+	qty := rule.roundQty(pos.Quantity)
+	if !qty.IsPositive() {
+		return "", fmt.Errorf("rounded quantity is not positive for %s", pos.Symbol)
+	}
+	if rule.MinSz.IsPositive() && qty.LessThan(rule.MinSz) {
+		return "", fmt.Errorf("quantity %s is less than min size %s for %s", qty, rule.MinSz, pos.Symbol)
+	}
+
+	clOrdID := fmt.Sprintf("bot%d", time.Now().UnixNano())
+
+	// WS order entry is the low-latency path; OKX demo does not support it.
+	if !c.simulated {
+		c.privateMu.Lock()
+		conn := c.privateConn
+		c.privateMu.Unlock()
+		if conn != nil {
+			orderID, err := c.placeOrderWS(conn, pos.Symbol, side, posSide, qty.String(), clOrdID)
+			if err == nil {
+				return orderID, nil
+			}
+			c.logger.Warn("ws order failed, falling back to REST", zap.Error(err))
+		}
+	}
+
+	return c.placeOrderREST(ctx, pos.Symbol, side, posSide, qty.String(), clOrdID)
 }
 
-func (c *Client) placeOrderWS(conn *websocket.Conn, symbol, side, posSide, sz string) (string, error) {
-	clientOrdID := fmt.Sprintf("bot%d", time.Now().UnixNano())
-	reqID := fmt.Sprintf("%d", time.Now().UnixNano())
+func (c *Client) placeOrderWS(conn *websocket.Conn, symbol, side, posSide, sz, clOrdID string) (string, error) {
+	reqID := fmt.Sprintf("req%d", time.Now().UnixNano())
 	ch := make(chan orderResult, 1)
 
 	c.privateMu.Lock()
-	c.orderResp[clientOrdID] = ch
+	c.orderResp[clOrdID] = ch
 	c.privateMu.Unlock()
 
 	defer func() {
 		c.privateMu.Lock()
-		delete(c.orderResp, clientOrdID)
+		delete(c.orderResp, clOrdID)
 		c.privateMu.Unlock()
 	}()
 
@@ -557,7 +688,7 @@ func (c *Client) placeOrderWS(conn *websocket.Conn, symbol, side, posSide, sz st
 		"id": reqID,
 		"op": "order",
 		"args": []orderArg{{
-			ClOrdID: clientOrdID,
+			ClOrdID: clOrdID,
 			InstID:  symbol,
 			TdMode:  "cross",
 			Side:    side,
@@ -574,12 +705,12 @@ func (c *Client) placeOrderWS(conn *websocket.Conn, symbol, side, posSide, sz st
 	select {
 	case result := <-ch:
 		return result.OrderID, result.Error
-	case <-time.After(3 * time.Second):
+	case <-time.After(2 * time.Second):
 		return "", fmt.Errorf("ws order timeout")
 	}
 }
 
-func (c *Client) placeOrderREST(ctx context.Context, symbol, side, posSide, sz string) (string, error) {
+func (c *Client) placeOrderREST(ctx context.Context, symbol, side, posSide, sz, clOrdID string) (string, error) {
 	body := map[string]any{
 		"instId":  symbol,
 		"tdMode":  "cross",
@@ -587,11 +718,12 @@ func (c *Client) placeOrderREST(ctx context.Context, symbol, side, posSide, sz s
 		"posSide": posSide,
 		"ordType": "market",
 		"sz":      sz,
+		"clOrdId": clOrdID,
 	}
 	var result []struct {
-		OrdID  string `json:"ordId"`
-		SCode  string `json:"sCode"`
-		SMsg   string `json:"sMsg"`
+		OrdID string `json:"ordId"`
+		SCode string `json:"sCode"`
+		SMsg  string `json:"sMsg"`
 	}
 	if err := c.privateJSON(ctx, http.MethodPost, "/api/v5/trade/order", nil, body, &result); err != nil {
 		return "", err
@@ -603,36 +735,6 @@ func (c *Client) placeOrderREST(ctx context.Context, symbol, side, posSide, sz s
 		return "", fmt.Errorf("okx order error: %s %s", result[0].SCode, result[0].SMsg)
 	}
 	return result[0].OrdID, nil
-}
-
-func (c *Client) CancelOrder(ctx context.Context, symbol, orderID string) error {
-	body := map[string]any{"instId": symbol, "ordId": orderID}
-	return c.privateJSON(ctx, http.MethodPost, "/api/v5/trade/cancel-order", nil, body, nil)
-}
-
-func (c *Client) GetBalance(ctx context.Context, asset string) (decimal.Decimal, error) {
-	var result []struct {
-		Details []struct {
-			Ccy    string `json:"ccy"`
-			Eq     string `json:"eq"`
-			AvailEq string `json:"availEq"`
-		} `json:"details"`
-	}
-	if err := c.privateJSON(ctx, http.MethodGet, "/api/v5/account/balance", nil, nil, &result); err != nil {
-		return decimal.Zero, err
-	}
-	for _, acct := range result {
-		for _, d := range acct.Details {
-			if d.Ccy == asset {
-				value, err := decimal.NewFromString(d.Eq)
-				if err != nil {
-					return decimal.Zero, fmt.Errorf("parse okx balance: %w", err)
-				}
-				return value, nil
-			}
-		}
-	}
-	return decimal.Zero, nil
 }
 
 func (c *Client) SetLeverage(ctx context.Context, symbol string, leverage int) error {
@@ -668,12 +770,70 @@ func (c *Client) GetMarkPrice(ctx context.Context, symbol string) (decimal.Decim
 }
 
 func (c *Client) ClosePosition(ctx context.Context, symbol string, side model.Side) error {
+	wantPosSide := "long"
+	closeSide := "sell"
+	if side == model.SideShort || side == model.SideSell {
+		wantPosSide = "short"
+		closeSide = "buy"
+	}
+
+	// Query the live position: works in both hedge (long/short) and net mode
+	var positions []struct {
+		PosSide string `json:"posSide"`
+		Pos     string `json:"pos"`
+	}
+	if err := c.privateJSON(ctx, http.MethodGet, "/api/v5/position", map[string]string{"instId": symbol}, nil, &positions); err != nil {
+		return fmt.Errorf("okx get position: %w", err)
+	}
+
+	posSide := ""
+	size := decimal.Zero
+	for _, p := range positions {
+		pos, err := decimal.NewFromString(p.Pos)
+		if err != nil || pos.IsZero() {
+			continue
+		}
+		switch p.PosSide {
+		case wantPosSide:
+			posSide = p.PosSide
+			size = pos.Abs()
+		case "net":
+			if (wantPosSide == "long" && pos.IsPositive()) || (wantPosSide == "short" && pos.IsNegative()) {
+				posSide = "net"
+				size = pos.Abs()
+			}
+		}
+		if posSide != "" {
+			break
+		}
+	}
+	if posSide == "" || !size.IsPositive() {
+		return nil // nothing to close
+	}
+
 	body := map[string]any{
 		"instId":  symbol,
-		"mgnMode": "cross",
-		"posSide": "net",
+		"tdMode":  "cross",
+		"side":    closeSide,
+		"posSide": posSide,
+		"ordType": "market",
+		"sz":      size.String(),
 	}
-	return c.privateJSON(ctx, http.MethodPost, "/api/v5/trade/close-position", nil, body, nil)
+	var result []struct {
+		OrdID string `json:"ordId"`
+		SCode string `json:"sCode"`
+		SMsg  string `json:"sMsg"`
+	}
+	if err := c.privateJSON(ctx, http.MethodPost, "/api/v5/trade/order", nil, body, &result); err != nil {
+		return fmt.Errorf("okx close order: %w", err)
+	}
+	if len(result) == 0 {
+		return fmt.Errorf("okx close: no order id returned")
+	}
+	if result[0].SCode != "0" {
+		return fmt.Errorf("okx close error: %s %s", result[0].SCode, result[0].SMsg)
+	}
+	return nil
 }
 
 func (c *Client) privateJSON(ctx context.Context, method, path string, query map[string]string, body any, out any) error {
@@ -701,8 +861,10 @@ func (c *Client) privateJSON(ctx context.Context, method, path string, query map
 		SetHeader("OK-ACCESS-SIGN", sig).
 		SetHeader("OK-ACCESS-TIMESTAMP", timestamp).
 		SetHeader("OK-ACCESS-PASSPHRASE", c.cfg.Passphrase).
-		SetHeader("x-simulated-trading", "1").
 		SetHeader("Content-Type", "application/json")
+	if c.simulated {
+		req.SetHeader("x-simulated-trading", "1")
+	}
 	if queryString != "" {
 		req.SetQueryString(queryString)
 	}

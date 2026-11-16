@@ -14,7 +14,6 @@ import (
 	"algos/internal/config"
 	"algos/internal/dex"
 	"algos/internal/exchange"
-	"algos/internal/exchange/bybit"
 	"algos/internal/exchange/okx"
 	"algos/internal/model"
 	"algos/internal/monitor"
@@ -30,9 +29,10 @@ func main() {
 	configPath := flag.String("config", "config.yaml", "path to YAML config")
 	symbolsFlag := flag.String("symbols", "", "comma-separated symbols to subscribe, e.g. BTCUSDT,ETHUSDT")
 	listingFlag := flag.String("listing", "", "optional listing definition SYMBOL:OPEN_PRICE, e.g. NEWUSDT:1.23")
-	autoDetect := flag.Bool("auto", false, "auto-detect new listings on Bybit")
+	autoDetect := flag.Bool("auto", false, "auto-detect new listings on OKX")
 	dexMonitor := flag.Bool("dex", false, "enable DEX monitoring for pre-listing detection")
 	testOrder := flag.String("test-order", "", "place a test market order SYMBOL:SIDE (buy/sell), e.g. BTCUSDT:buy")
+	confirmProd := flag.Bool("confirm-prod", false, "required to run mainnet with live trading")
 	flag.Parse()
 
 	logger, err := zap.NewProduction()
@@ -44,6 +44,13 @@ func main() {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		logger.Fatal("load config", zap.Error(err))
+	}
+
+	if cfg.Bot.Mode == "mainnet" && cfg.Bot.TradingMode == "live" && !*confirmProd {
+		logger.Fatal("refusing to trade live on mainnet: pass -confirm-prod after double-checking the config")
+	}
+	if cfg.Bot.Mode != "mainnet" && cfg.Bot.TradingMode == "live" {
+		logger.Warn("live trading on testnet/demo: orders go to OKX simulated trading")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -64,40 +71,38 @@ func main() {
 	var client exchange.Client
 	var exchangeName string
 
-	// Try OKX first, then Bybit
+	// OKX is the only supported exchange
 	if okxCfg, ok := cfg.Exchanges["okx"]; ok && okxCfg.Enabled {
 		client = okx.New(okxCfg, logger, cfg.Bot)
 		exchangeName = "okx"
 		logger.Info("using OKX exchange")
-	} else if bybitCfg, ok := cfg.Exchanges["bybit"]; ok && bybitCfg.Enabled {
-		client = bybit.New(bybitCfg, logger, cfg.Bot)
-		exchangeName = "bybit"
-		logger.Info("using Bybit exchange")
 	} else {
-		logger.Fatal("no exchange enabled")
+		logger.Fatal("no exchange enabled: set exchanges.okx.enabled=true")
 	}
 
 	orderManager := order.NewManager(cfg, client, riskManager, store, notifier, logger)
 	engine := app.NewEngine(cfg, riskManager, orderManager, logger)
+	restoreOpenPositions(ctx, store, orderManager, engine, notifier, logger)
 	go orderManager.RunMonitor(ctx)
 
 	if *testOrder != "" {
-		placeTestOrder(ctx, client, *testOrder, logger)
+		placeTestOrder(ctx, client, exchangeName, *testOrder, logger)
 		return
 	}
 
 	symbols := splitCSV(*symbolsFlag)
 	if *listingFlag != "" {
 		parts := strings.SplitN(*listingFlag, ":", 2)
-		if len(parts) == 1 || len(parts) == 2 {
-			listingSymbol := parts[0]
-			symbols = appendUnique(symbols, listingSymbol)
+		if len(parts) == 2 {
+			symbols = appendUnique(symbols, parts[0])
+			registerListingFlag(engine, exchangeName, *listingFlag, logger)
+		} else {
+			logger.Warn("invalid -listing, expected SYMBOL:OPEN_PRICE", zap.String("value", *listingFlag))
 		}
-		registerListingFlag(engine, exchangeName, *listingFlag, logger)
 	}
 
 	if *autoDetect {
-		go runListingDetector(ctx, client, exchangeName, engine, logger)
+		go runListingDetector(ctx, client, exchangeName, engine, cfg.Bot.MaxLeverage, logger)
 	}
 
 	if *dexMonitor {
@@ -121,13 +126,62 @@ func main() {
 	}
 
 	logger.Info("starting public market data", zap.Strings("symbols", symbols), zap.String("mode", cfg.Bot.Mode))
+	prepareSymbols(ctx, client, symbols, cfg.Bot.MaxLeverage, logger)
 	if err := client.ConnectPublic(ctx, symbols, engine); err != nil && ctx.Err() == nil {
 		logger.Fatal("public market data stopped", zap.Error(err))
 	}
 	orderManager.CloseAll(context.Background())
 }
 
-func runListingDetector(ctx context.Context, client exchange.Client, exchangeName string, engine *app.Engine, logger *zap.Logger) {
+func prepareSymbols(ctx context.Context, client exchange.Client, symbols []string, leverage int, logger *zap.Logger) {
+	for _, symbol := range symbols {
+		warmCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		if err := client.PrepareSymbol(warmCtx, symbol, leverage); err != nil {
+			logger.Warn("prepare symbol failed", zap.String("symbol", symbol), zap.Error(err))
+		}
+		cancel()
+	}
+}
+
+func restoreOpenPositions(ctx context.Context, store *storage.BoltStore, orders *order.Manager, engine *app.Engine, notifier monitor.Notifier, logger *zap.Logger) {
+	positions, err := store.LoadOpenPositions()
+	if err != nil {
+		logger.Error("load open positions", zap.Error(err))
+		return
+	}
+	if len(positions) == 0 {
+		return
+	}
+
+	logger.Warn("open positions found in storage", zap.Int("count", len(positions)))
+	for i, pos := range positions {
+		if i > 0 {
+			logger.Error("extra open position ignored (single-position bot), close it manually",
+				zap.String("id", pos.ID), zap.String("symbol", pos.Symbol))
+			if err := notifier.Notify(ctx, fmt.Sprintf("⚠️ extra open position ignored, close manually: %s %s (%s)", pos.Symbol, pos.Side, pos.ID)); err != nil {
+				logger.Warn("notify extra position", zap.Error(err))
+			}
+			continue
+		}
+		if err := orders.RestorePosition(pos); err != nil {
+			logger.Error("restore position", zap.String("id", pos.ID), zap.Error(err))
+			continue
+		}
+		engine.MarkEntered(pos.Exchange, pos.Symbol)
+		logger.Warn("restored open position",
+			zap.String("id", pos.ID),
+			zap.String("symbol", pos.Symbol),
+			zap.String("side", string(pos.Side)),
+			zap.String("entry", pos.EntryPrice.String()),
+			zap.String("qty", pos.Quantity.String()),
+		)
+		if err := notifier.Notify(ctx, fmt.Sprintf("♻️ restored open position: %s %s | entry %s | qty %s", pos.Symbol, pos.Side, pos.EntryPrice, pos.Quantity)); err != nil {
+			logger.Warn("notify restore", zap.Error(err))
+		}
+	}
+}
+
+func runListingDetector(ctx context.Context, client exchange.Client, exchangeName string, engine *app.Engine, maxLeverage int, logger *zap.Logger) {
 	logger.Info("listing detector started, polling every 10s", zap.String("exchange", exchangeName))
 
 	known := make(map[string]bool)
@@ -177,6 +231,7 @@ func runListingDetector(ctx context.Context, client exchange.Client, exchangeNam
 		if err := client.SubscribeSymbols(newSymbols); err != nil {
 			logger.Warn("subscribe new symbols failed", zap.Error(err))
 		}
+		prepareSymbols(ctx, client, newSymbols, maxLeverage, logger)
 	}
 }
 
@@ -204,7 +259,7 @@ func appendUnique(slice []string, s string) []string {
 	return append(slice, s)
 }
 
-func placeTestOrder(ctx context.Context, client exchange.Client, value string, logger *zap.Logger) {
+func placeTestOrder(ctx context.Context, client exchange.Client, exchangeName, value string, logger *zap.Logger) {
 	parts := strings.SplitN(value, ":", 2)
 	if len(parts) != 2 {
 		logger.Fatal("test-order format: SYMBOL:SIDE (buy/sell)", zap.String("value", value))
@@ -228,7 +283,7 @@ func placeTestOrder(ctx context.Context, client exchange.Client, value string, l
 	qty := decimal.RequireFromString("0.01")
 	pos := &model.Position{
 		ID:         fmt.Sprintf("test-%s-%d", symbol, time.Now().UnixNano()),
-		Exchange:   "bybit",
+		Exchange:   exchangeName,
 		Symbol:     symbol,
 		Side:       side,
 		EntryPrice: price,
@@ -240,7 +295,7 @@ func placeTestOrder(ctx context.Context, client exchange.Client, value string, l
 		logger.Fatal("place test order", zap.Error(err))
 	}
 	logger.Info("TEST ORDER PLACED", zap.String("orderID", orderID), zap.String("symbol", symbol), zap.String("side", string(side)), zap.String("qty", qty.String()))
-	logger.Info("CHECK BYBIT TESTNET - you should see the order in your account!")
+	logger.Info("check your exchange account — you should see the order there", zap.String("exchange", exchangeName))
 
 	<-ctx.Done()
 }

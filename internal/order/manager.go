@@ -3,6 +3,7 @@ package order
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -17,6 +18,13 @@ import (
 	"go.uber.org/zap"
 )
 
+const latencyWindow = 256
+
+type latencySample struct {
+	decision time.Duration
+	place    time.Duration
+}
+
 type Manager struct {
 	cfg    *config.Config
 	exec   exchange.Client
@@ -26,12 +34,37 @@ type Manager struct {
 	logger *zap.Logger
 	paper  bool
 
-	mu       sync.Mutex
-	position *model.Position
+	mu            sync.Mutex
+	position      *model.Position
+	prices        map[string]decimal.Decimal
+	latency       []latencySample
+	closing       bool
+	closeFailures int
+	closeNotified bool
 }
 
 func NewManager(cfg *config.Config, exec exchange.Client, riskManager *risk.Manager, store *storage.BoltStore, notifier monitor.Notifier, logger *zap.Logger) *Manager {
-	return &Manager{cfg: cfg, exec: exec, risk: riskManager, store: store, notify: notifier, logger: logger.Named("order"), paper: cfg.Bot.TradingMode != "live"}
+	return &Manager{
+		cfg:    cfg,
+		exec:   exec,
+		risk:   riskManager,
+		store:  store,
+		notify: notifier,
+		logger: logger.Named("order"),
+		paper:  cfg.Bot.TradingMode != "live",
+		prices: make(map[string]decimal.Decimal),
+	}
+}
+
+// UpdateMarkPrice feeds the latest market price from the public websocket so
+// position monitoring does not need REST polling.
+func (m *Manager) UpdateMarkPrice(symbol string, price decimal.Decimal) {
+	if !price.IsPositive() {
+		return
+	}
+	m.mu.Lock()
+	m.prices[symbol] = price
+	m.mu.Unlock()
 }
 
 func (m *Manager) HasPosition() bool {
@@ -83,16 +116,25 @@ func (m *Manager) OpenFromSignal(ctx context.Context, signal model.Signal) (*mod
 	m.mu.Unlock()
 
 	if !m.paper {
-		if err := m.exec.SetLeverage(ctx, pos.Symbol, pos.Leverage); err != nil {
+		if err := m.exec.PrepareSymbol(ctx, pos.Symbol, pos.Leverage); err != nil {
 			m.clearPosition()
-			return nil, fmt.Errorf("set leverage: %w", err)
+			return nil, fmt.Errorf("prepare symbol: %w", err)
 		}
+		placeStart := time.Now()
 		orderID, err := m.exec.PlaceOrder(ctx, pos)
 		if err != nil {
 			m.clearPosition()
 			return nil, fmt.Errorf("place order: %w", err)
 		}
-		m.logger.Info("order placed", zap.String("order_id", orderID), zap.String("symbol", pos.Symbol))
+		placeLatency := time.Since(placeStart)
+		decisionLatency := placeStart.Sub(signal.CreatedAt)
+		m.recordLatency(decisionLatency, placeLatency)
+		m.logger.Info("order placed",
+			zap.String("order_id", orderID),
+			zap.String("symbol", pos.Symbol),
+			zap.Duration("decision_latency", decisionLatency),
+			zap.Duration("place_latency", placeLatency),
+		)
 	} else {
 		m.logger.Info("paper order", zap.String("symbol", pos.Symbol), zap.String("side", string(pos.Side)))
 	}
@@ -141,16 +183,62 @@ func (m *Manager) CloseAll(ctx context.Context) {
 func (m *Manager) checkPosition(ctx context.Context, now time.Time) {
 	m.mu.Lock()
 	pos := m.position
+	cached := decimal.Zero
+	if pos != nil {
+		cached = m.prices[pos.Symbol]
+	}
 	m.mu.Unlock()
-	if pos == nil || m.paper {
+	if pos == nil {
 		return
 	}
-	mark, err := m.exec.GetMarkPrice(ctx, pos.Symbol)
-	if err != nil {
-		m.logger.Warn("get mark price", zap.Error(err))
-		return
+
+	mark := cached
+	if !mark.IsPositive() {
+		if m.exec == nil {
+			return
+		}
+		var err error
+		mark, err = m.exec.GetMarkPrice(ctx, pos.Symbol)
+		if err != nil {
+			m.logger.Warn("get mark price", zap.Error(err))
+			return
+		}
 	}
 	m.closeIfNeeded(ctx, mark, now)
+}
+
+func (m *Manager) recordLatency(decision, place time.Duration) {
+	m.mu.Lock()
+	m.latency = append(m.latency, latencySample{decision: decision, place: place})
+	if len(m.latency) > latencyWindow {
+		m.latency = m.latency[len(m.latency)-latencyWindow:]
+	}
+	samples := make([]latencySample, len(m.latency))
+	copy(samples, m.latency)
+	count := len(samples)
+	m.mu.Unlock()
+
+	if count%25 != 0 {
+		return
+	}
+	decisions := make([]time.Duration, count)
+	places := make([]time.Duration, count)
+	for i, s := range samples {
+		decisions[i] = s.decision
+		places[i] = s.place
+	}
+	sort.Slice(decisions, func(i, j int) bool { return decisions[i] < decisions[j] })
+	sort.Slice(places, func(i, j int) bool { return places[i] < places[j] })
+	percentile := func(list []time.Duration, q float64) time.Duration {
+		return list[int(float64(len(list)-1)*q)]
+	}
+	m.logger.Info("latency stats",
+		zap.Int("orders", count),
+		zap.Duration("decision_p50", percentile(decisions, 0.5)),
+		zap.Duration("decision_p95", percentile(decisions, 0.95)),
+		zap.Duration("place_p50", percentile(places, 0.5)),
+		zap.Duration("place_p95", percentile(places, 0.95)),
+	)
 }
 
 func (m *Manager) closeIfNeeded(ctx context.Context, markPrice decimal.Decimal, now time.Time) {
@@ -168,11 +256,42 @@ func (m *Manager) closeIfNeeded(ctx context.Context, markPrice decimal.Decimal, 
 }
 
 func (m *Manager) closePosition(ctx context.Context, pos *model.Position, exitPrice decimal.Decimal, now time.Time, reason model.ExitReason) {
+	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return
+	}
+	m.closing = true
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		m.closing = false
+		m.mu.Unlock()
+	}()
+
 	if !m.paper {
 		if err := m.exec.ClosePosition(ctx, pos.Symbol, pos.Side); err != nil {
-			m.logger.Error("close position", zap.Error(err))
+			m.logger.Error("close position", zap.String("id", pos.ID), zap.Error(err))
+			m.mu.Lock()
+			m.closeFailures++
+			failures := m.closeFailures
+			first := !m.closeNotified
+			if first {
+				m.closeNotified = true
+			}
+			m.mu.Unlock()
+			if first {
+				if nerr := m.notify.Notify(ctx, fmt.Sprintf("⚠️ failed to close %s %s: %v — will retry", pos.Symbol, pos.Side, err)); nerr != nil {
+					m.logger.Warn("notify close failure", zap.Error(nerr))
+				}
+			}
+			m.logger.Warn("close attempt failed", zap.String("id", pos.ID), zap.Int("failures", failures))
 			return
 		}
+		m.mu.Lock()
+		m.closeFailures = 0
+		m.closeNotified = false
+		m.mu.Unlock()
 	}
 	closed := *pos
 	closed.ClosedAt = &now
@@ -194,10 +313,21 @@ func (m *Manager) closePosition(ctx context.Context, pos *model.Position, exitPr
 	}
 	m.logger.Info("position closed", zap.String("id", closed.ID), zap.String("reason", string(reason)), zap.String("pnl_percent", closed.PnLPercent.StringFixed(4)))
 	if m.risk.KillSwitchActive() {
-		if err := m.notify.Notify(ctx, "⛔ KILL SWITCH ACTIVATED. 3 losses in a row."); err != nil {
+		if err := m.notify.Notify(ctx, fmt.Sprintf("⛔ KILL SWITCH ACTIVATED. %d losses in a row.", m.cfg.Bot.KillSwitchLosses)); err != nil {
 			m.logger.Warn("notify kill switch", zap.Error(err))
 		}
 	}
+}
+
+func (m *Manager) RestorePosition(pos model.Position) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.position != nil {
+		return fmt.Errorf("position already open")
+	}
+	restored := pos
+	m.position = &restored
+	return nil
 }
 
 func (m *Manager) clearPosition() {

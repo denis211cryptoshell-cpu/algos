@@ -1,8 +1,8 @@
 package storage
 
 import (
-	"github.com/bytedance/sonic"
 	"fmt"
+	"github.com/bytedance/sonic"
 	"os"
 	"path/filepath"
 	"time"
@@ -85,6 +85,31 @@ func (s *BoltStore) SavePosition(position model.Position) error {
 	return s.db.Update(func(tx *bbolt.Tx) error {
 		return tx.Bucket(positionsBucket).Put([]byte(position.ID), payload)
 	})
+}
+
+// LoadOpenPositions returns all positions that have no close timestamp yet.
+func (s *BoltStore) LoadOpenPositions() ([]model.Position, error) {
+	var open []model.Position
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(positionsBucket)
+		if bucket == nil {
+			return nil
+		}
+		return bucket.ForEach(func(_, value []byte) error {
+			var pos model.Position
+			if err := sonic.Unmarshal(value, &pos); err != nil {
+				return nil // skip corrupt entries
+			}
+			if pos.IsOpen() {
+				open = append(open, pos)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, fmt.Errorf("load open positions: %w", err)
+	}
+	return open, nil
 }
 
 func (s *BoltStore) SaveEvent(key string, value any) error {

@@ -11,10 +11,10 @@ import (
 )
 
 var (
-	decOne    = decimal.NewFromInt(1)
-	decTwo    = decimal.NewFromInt(2)
-	dec100    = decimal.NewFromInt(100)
-	decHalf   = decOne.Div(decTwo)
+	decOne  = decimal.NewFromInt(1)
+	decTwo  = decimal.NewFromInt(2)
+	dec100  = decimal.NewFromInt(100)
+	decHalf = decOne.Div(decTwo)
 )
 
 type MomentumStrategy struct {
