@@ -26,8 +26,11 @@ type Manager struct {
 	logger *zap.Logger
 	paper  bool
 
-	mu       sync.Mutex
-	position *model.Position
+	mu            sync.Mutex
+	position      *model.Position
+	closing       bool
+	closeFailures int
+	closeNotified bool
 }
 
 func NewManager(cfg *config.Config, exec exchange.Client, riskManager *risk.Manager, store *storage.BoltStore, notifier monitor.Notifier, logger *zap.Logger) *Manager {
@@ -142,7 +145,10 @@ func (m *Manager) checkPosition(ctx context.Context, now time.Time) {
 	m.mu.Lock()
 	pos := m.position
 	m.mu.Unlock()
-	if pos == nil || m.paper {
+	if pos == nil {
+		return
+	}
+	if m.exec == nil {
 		return
 	}
 	mark, err := m.exec.GetMarkPrice(ctx, pos.Symbol)
@@ -168,11 +174,42 @@ func (m *Manager) closeIfNeeded(ctx context.Context, markPrice decimal.Decimal, 
 }
 
 func (m *Manager) closePosition(ctx context.Context, pos *model.Position, exitPrice decimal.Decimal, now time.Time, reason model.ExitReason) {
+	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return
+	}
+	m.closing = true
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		m.closing = false
+		m.mu.Unlock()
+	}()
+
 	if !m.paper {
 		if err := m.exec.ClosePosition(ctx, pos.Symbol, pos.Side); err != nil {
-			m.logger.Error("close position", zap.Error(err))
+			m.logger.Error("close position", zap.String("id", pos.ID), zap.Error(err))
+			m.mu.Lock()
+			m.closeFailures++
+			failures := m.closeFailures
+			first := !m.closeNotified
+			if first {
+				m.closeNotified = true
+			}
+			m.mu.Unlock()
+			if first {
+				if nerr := m.notify.Notify(ctx, fmt.Sprintf("⚠️ failed to close %s %s: %v — will retry", pos.Symbol, pos.Side, err)); nerr != nil {
+					m.logger.Warn("notify close failure", zap.Error(nerr))
+				}
+			}
+			m.logger.Warn("close attempt failed", zap.String("id", pos.ID), zap.Int("failures", failures))
 			return
 		}
+		m.mu.Lock()
+		m.closeFailures = 0
+		m.closeNotified = false
+		m.mu.Unlock()
 	}
 	closed := *pos
 	closed.ClosedAt = &now
@@ -194,10 +231,21 @@ func (m *Manager) closePosition(ctx context.Context, pos *model.Position, exitPr
 	}
 	m.logger.Info("position closed", zap.String("id", closed.ID), zap.String("reason", string(reason)), zap.String("pnl_percent", closed.PnLPercent.StringFixed(4)))
 	if m.risk.KillSwitchActive() {
-		if err := m.notify.Notify(ctx, "⛔ KILL SWITCH ACTIVATED. 3 losses in a row."); err != nil {
+		if err := m.notify.Notify(ctx, fmt.Sprintf("⛔ KILL SWITCH ACTIVATED. %d losses in a row.", m.cfg.Bot.KillSwitchLosses)); err != nil {
 			m.logger.Warn("notify kill switch", zap.Error(err))
 		}
 	}
+}
+
+func (m *Manager) RestorePosition(pos model.Position) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.position != nil {
+		return fmt.Errorf("position already open")
+	}
+	restored := pos
+	m.position = &restored
+	return nil
 }
 
 func (m *Manager) clearPosition() {

@@ -125,7 +125,7 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-func (c Config) Validate() error {
+func (c *Config) Validate() error {
 	if c.Bot.Mode != "testnet" && c.Bot.Mode != "mainnet" {
 		return fmt.Errorf("bot.mode must be testnet or mainnet, got %q", c.Bot.Mode)
 	}

@@ -74,6 +74,7 @@ func main() {
 
 	orderManager := order.NewManager(cfg, client, riskManager, store, notifier, logger)
 	engine := app.NewEngine(cfg, riskManager, orderManager, logger)
+	restoreOpenPositions(ctx, store, orderManager, engine, notifier, logger)
 	go orderManager.RunMonitor(ctx)
 
 	if *testOrder != "" {
@@ -84,11 +85,12 @@ func main() {
 	symbols := splitCSV(*symbolsFlag)
 	if *listingFlag != "" {
 		parts := strings.SplitN(*listingFlag, ":", 2)
-		if len(parts) == 1 || len(parts) == 2 {
-			listingSymbol := parts[0]
-			symbols = appendUnique(symbols, listingSymbol)
+		if len(parts) == 2 {
+			symbols = appendUnique(symbols, parts[0])
+			registerListingFlag(engine, exchangeName, *listingFlag, logger)
+		} else {
+			logger.Warn("invalid -listing, expected SYMBOL:OPEN_PRICE", zap.String("value", *listingFlag))
 		}
-		registerListingFlag(engine, exchangeName, *listingFlag, logger)
 	}
 
 	if *autoDetect {
@@ -120,6 +122,44 @@ func main() {
 		logger.Fatal("public market data stopped", zap.Error(err))
 	}
 	orderManager.CloseAll(context.Background())
+}
+
+func restoreOpenPositions(ctx context.Context, store *storage.BoltStore, orders *order.Manager, engine *app.Engine, notifier monitor.Notifier, logger *zap.Logger) {
+	positions, err := store.LoadOpenPositions()
+	if err != nil {
+		logger.Error("load open positions", zap.Error(err))
+		return
+	}
+	if len(positions) == 0 {
+		return
+	}
+
+	logger.Warn("open positions found in storage", zap.Int("count", len(positions)))
+	for i, pos := range positions {
+		if i > 0 {
+			logger.Error("extra open position ignored (single-position bot), close it manually",
+				zap.String("id", pos.ID), zap.String("symbol", pos.Symbol))
+			if err := notifier.Notify(ctx, fmt.Sprintf("⚠️ extra open position ignored, close manually: %s %s (%s)", pos.Symbol, pos.Side, pos.ID)); err != nil {
+				logger.Warn("notify extra position", zap.Error(err))
+			}
+			continue
+		}
+		if err := orders.RestorePosition(pos); err != nil {
+			logger.Error("restore position", zap.String("id", pos.ID), zap.Error(err))
+			continue
+		}
+		engine.MarkEntered(pos.Exchange, pos.Symbol)
+		logger.Warn("restored open position",
+			zap.String("id", pos.ID),
+			zap.String("symbol", pos.Symbol),
+			zap.String("side", string(pos.Side)),
+			zap.String("entry", pos.EntryPrice.String()),
+			zap.String("qty", pos.Quantity.String()),
+		)
+		if err := notifier.Notify(ctx, fmt.Sprintf("♻️ restored open position: %s %s | entry %s | qty %s", pos.Symbol, pos.Side, pos.EntryPrice, pos.Quantity)); err != nil {
+			logger.Warn("notify restore", zap.Error(err))
+		}
+	}
 }
 
 func runListingDetector(ctx context.Context, client exchange.Client, exchangeName string, engine *app.Engine, logger *zap.Logger) {

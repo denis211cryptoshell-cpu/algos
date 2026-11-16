@@ -62,6 +62,15 @@ func (e *Engine) RegisterListing(exchangeName, symbol string, listingTime time.T
 	e.logger.Info("registered listing", zap.String("exchange", exchangeName), zap.String("symbol", symbol), zap.Time("listing_time", listingTime), zap.String("opening_price", openingPrice.String()))
 }
 
+// MarkEntered marks a market as already traded so the engine will not open a
+// second position for it (used when restoring a position after restart).
+func (e *Engine) MarkEntered(exchangeName, symbol string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	state := e.ensureMarketLocked(exchangeName, symbol, time.Now().UTC(), decimal.Zero)
+	state.entered = true
+}
+
 func (e *Engine) OnTrade(trade model.Trade) {
 	e.mu.Lock()
 	state := e.ensureMarketLocked(trade.Exchange, trade.Symbol, trade.Timestamp, trade.Price)

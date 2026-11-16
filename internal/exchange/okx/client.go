@@ -40,6 +40,7 @@ type Client struct {
 	privateMu   sync.Mutex
 	orderResp   map[string]chan orderResult
 
+	simulated  bool
 	timeOffset int64
 }
 
@@ -61,6 +62,25 @@ func New(cfg config.ExchangeConfig, logger *zap.Logger, botCfg ...config.BotConf
 	if bot.RecvWindow == "" {
 		bot.RecvWindow = "5000"
 	}
+	// Mode wiring: testnet = OKX demo (simulated trading), mainnet = real trading
+	simulated := bot.Mode != "mainnet"
+	if cfg.BaseURL == "" {
+		cfg.BaseURL = "https://www.okx.com"
+	}
+	if cfg.WSPublic == "" {
+		if simulated {
+			cfg.WSPublic = "wss://wspap.okx.com:8443/ws/v5/public?brokerId=9999"
+		} else {
+			cfg.WSPublic = "wss://ws.okx.com:8443/ws/v5/public"
+		}
+	}
+	if cfg.WSPrivate == "" {
+		if simulated {
+			cfg.WSPrivate = "wss://wspap.okx.com:8443/ws/v5/private?brokerId=9999"
+		} else {
+			cfg.WSPrivate = "wss://ws.okx.com:8443/ws/v5/private"
+		}
+	}
 	// Optimized HTTP client with keep-alive and connection pooling
 	httpClient := &http.Client{
 		Timeout: 3 * time.Second,
@@ -73,11 +93,12 @@ func New(cfg config.ExchangeConfig, logger *zap.Logger, botCfg ...config.BotConf
 	}
 	restyClient := resty.NewWithClient(httpClient).SetBaseURL(cfg.BaseURL)
 	c := &Client{
-		cfg:    cfg,
-		bot:    bot,
-		resty:  restyClient,
-		logger: logger.Named("okx"),
-		books:  make(map[string]*localBook),
+		cfg:       cfg,
+		bot:       bot,
+		resty:     restyClient,
+		logger:    logger.Named("okx"),
+		books:     make(map[string]*localBook),
+		simulated: simulated,
 	}
 	c.syncTime()
 	c.orderResp = make(map[string]chan orderResult)
@@ -88,7 +109,8 @@ func New(cfg config.ExchangeConfig, logger *zap.Logger, botCfg ...config.BotConf
 func (c *Client) connectPrivateWS() {
 	wsURL := c.cfg.WSPrivate
 	if wsURL == "" {
-		wsURL = "wss://wspap.okx.com:8443/ws/v5/private?brokerId=9999"
+		c.logger.Error("okx private ws url is empty")
+		return
 	}
 
 	for {
@@ -194,7 +216,11 @@ func (c *Client) handlePrivateMessage(raw []byte) {
 					if o.SCode != "0" {
 						result.Error = fmt.Errorf("okx order error: %s %s", o.SCode, o.SMsg)
 					}
-					ch <- result
+					// Non-blocking: never stall the private WS read loop
+					select {
+					case ch <- result:
+					default:
+					}
 				}
 			}
 		}
@@ -611,12 +637,70 @@ func (c *Client) GetMarkPrice(ctx context.Context, symbol string) (decimal.Decim
 }
 
 func (c *Client) ClosePosition(ctx context.Context, symbol string, side model.Side) error {
+	wantPosSide := "long"
+	closeSide := "sell"
+	if side == model.SideShort || side == model.SideSell {
+		wantPosSide = "short"
+		closeSide = "buy"
+	}
+
+	// Query the live position: works in both hedge (long/short) and net mode
+	var positions []struct {
+		PosSide string `json:"posSide"`
+		Pos     string `json:"pos"`
+	}
+	if err := c.privateJSON(ctx, http.MethodGet, "/api/v5/position", map[string]string{"instId": symbol}, nil, &positions); err != nil {
+		return fmt.Errorf("okx get position: %w", err)
+	}
+
+	posSide := ""
+	size := decimal.Zero
+	for _, p := range positions {
+		pos, err := decimal.NewFromString(p.Pos)
+		if err != nil || pos.IsZero() {
+			continue
+		}
+		switch p.PosSide {
+		case wantPosSide:
+			posSide = p.PosSide
+			size = pos.Abs()
+		case "net":
+			if (wantPosSide == "long" && pos.IsPositive()) || (wantPosSide == "short" && pos.IsNegative()) {
+				posSide = "net"
+				size = pos.Abs()
+			}
+		}
+		if posSide != "" {
+			break
+		}
+	}
+	if posSide == "" || !size.IsPositive() {
+		return nil // nothing to close
+	}
+
 	body := map[string]any{
 		"instId":  symbol,
-		"mgnMode": "cross",
-		"posSide": "net",
+		"tdMode":  "cross",
+		"side":    closeSide,
+		"posSide": posSide,
+		"ordType": "market",
+		"sz":      size.String(),
 	}
-	return c.privateJSON(ctx, http.MethodPost, "/api/v5/trade/close-position", nil, body, nil)
+	var result []struct {
+		OrdID string `json:"ordId"`
+		SCode string `json:"sCode"`
+		SMsg  string `json:"sMsg"`
+	}
+	if err := c.privateJSON(ctx, http.MethodPost, "/api/v5/trade/order", nil, body, &result); err != nil {
+		return fmt.Errorf("okx close order: %w", err)
+	}
+	if len(result) == 0 {
+		return fmt.Errorf("okx close: no order id returned")
+	}
+	if result[0].SCode != "0" {
+		return fmt.Errorf("okx close error: %s %s", result[0].SCode, result[0].SMsg)
+	}
+	return nil
 }
 
 func (c *Client) privateJSON(ctx context.Context, method, path string, query map[string]string, body any, out any) error {
@@ -644,8 +728,10 @@ func (c *Client) privateJSON(ctx context.Context, method, path string, query map
 		SetHeader("OK-ACCESS-SIGN", sig).
 		SetHeader("OK-ACCESS-TIMESTAMP", timestamp).
 		SetHeader("OK-ACCESS-PASSPHRASE", c.cfg.Passphrase).
-		SetHeader("x-simulated-trading", "1").
 		SetHeader("Content-Type", "application/json")
+	if c.simulated {
+		req.SetHeader("x-simulated-trading", "1")
+	}
 	if queryString != "" {
 		req.SetQueryString(queryString)
 	}
