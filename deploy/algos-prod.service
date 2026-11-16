@@ -1,0 +1,15 @@
+[Unit]
+Description=ALGOS listing sniper (production)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=algos
+WorkingDirectory=/opt/algos
+ExecStart=/opt/algos/bin/algos -config /opt/algos/config.prod.yaml -confirm-prod -auto -dex
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

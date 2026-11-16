@@ -1,5 +1,7 @@
 # Secrets & API keys
 config.yaml
+config.testnet.yaml
+config.prod.yaml
 .env
 .env.*
 

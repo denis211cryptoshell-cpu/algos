@@ -32,6 +32,7 @@ func main() {
 	autoDetect := flag.Bool("auto", false, "auto-detect new listings on OKX")
 	dexMonitor := flag.Bool("dex", false, "enable DEX monitoring for pre-listing detection")
 	testOrder := flag.String("test-order", "", "place a test market order SYMBOL:SIDE (buy/sell), e.g. BTCUSDT:buy")
+	confirmProd := flag.Bool("confirm-prod", false, "required to run mainnet with live trading")
 	flag.Parse()
 
 	logger, err := zap.NewProduction()
@@ -43,6 +44,13 @@ func main() {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		logger.Fatal("load config", zap.Error(err))
+	}
+
+	if cfg.Bot.Mode == "mainnet" && cfg.Bot.TradingMode == "live" && !*confirmProd {
+		logger.Fatal("refusing to trade live on mainnet: pass -confirm-prod after double-checking the config")
+	}
+	if cfg.Bot.Mode != "mainnet" && cfg.Bot.TradingMode == "live" {
+		logger.Warn("live trading on testnet/demo: orders go to OKX simulated trading")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

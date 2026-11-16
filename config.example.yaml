@@ -1,0 +1,46 @@
+# ALGOS configuration example.
+# Copy to config.testnet.yaml (demo) or config.prod.yaml (mainnet) and fill in keys.
+bot:
+  mode: "testnet"              # testnet (OKX demo/simulated) | mainnet
+  trading_mode: "paper"        # paper | live
+  max_position_seconds: 20     # max position lifetime
+  kill_switch_losses: 3        # stop trading after N consecutive losses
+  max_leverage: 3
+  tp_percent: "4.0"            # take profit %
+  sl_percent: "1.5"            # stop loss %
+  position_check_ms: 50        # position evaluation interval
+  recv_window: "5000"          # OKX signed request recv window (ms)
+
+exchanges:
+  okx:
+    enabled: true
+    api_key: "YOUR_KEY"
+    api_secret: "YOUR_SECRET"
+    passphrase: "YOUR_PASSPHRASE"
+    # Leave empty to use mode defaults:
+    #   testnet -> wspap.okx.com (simulated), mainnet -> ws.okx.com (real)
+    base_url: ""
+    ws_public: ""
+    ws_private: ""
+
+strategy:
+  imbalance_ratio: "1.3"            # min bid/ask notional ratio
+  trade_velocity_ratio: "1.5"       # min buy/sell notional ratio
+  liquidity_radius_percent: "1.5"   # orderbook radius for liquidity sizing
+  orderbook_radius_percent: "2.0"   # orderbook radius for imbalance
+  max_position_pct_liquidity: "10.0"
+  opening_window_seconds: 3         # entry window after listing
+  dex_fair_price_enabled: false
+  dex_fair_price: "0"
+  short_overprice_multiplier: "2.5"
+  min_liquidity_notional: "0"
+  max_spread_percent: "0"           # 0 disables the spread filter
+  min_trades: 0
+
+monitor:
+  telegram_bot_token: ""
+  telegram_chat_id: ""
+
+storage:
+  # Keep testnet and prod data separate
+  bolt_path: "data/testnet/trades.db"

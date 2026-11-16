@@ -1,0 +1,15 @@
+[Unit]
+Description=ALGOS listing sniper (testnet/demo)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=algos
+WorkingDirectory=/opt/algos
+ExecStart=/opt/algos/bin/algos -config /opt/algos/config.testnet.yaml -auto -dex
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
