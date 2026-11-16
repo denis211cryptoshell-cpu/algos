@@ -24,7 +24,7 @@ func (f *fakeExec) ConnectPublic(context.Context, []string, exchange.MarketDataH
 	return nil
 }
 func (f *fakeExec) PlaceOrder(context.Context, *model.Position) (string, error) { return "fake", nil }
-func (f *fakeExec) SetLeverage(context.Context, string, int) error              { return nil }
+func (f *fakeExec) PrepareSymbol(context.Context, string, int) error            { return nil }
 func (f *fakeExec) GetMarkPrice(context.Context, string) (decimal.Decimal, error) {
 	return f.mark, nil
 }

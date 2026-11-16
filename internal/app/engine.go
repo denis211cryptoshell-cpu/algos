@@ -84,6 +84,7 @@ func (e *Engine) OnTrade(trade model.Trade) {
 	e.maybeLogActivity()
 	e.mu.Unlock()
 
+	e.orders.UpdateMarkPrice(trade.Symbol, trade.Price)
 	e.evaluate(context.Background(), snapshot)
 }
 
@@ -103,6 +104,9 @@ func (e *Engine) OnOrderbook(orderbook model.Orderbook) {
 	e.maybeLogActivity()
 	e.mu.Unlock()
 
+	if mid := bestMid(orderbook); mid.IsPositive() {
+		e.orders.UpdateMarkPrice(orderbook.Symbol, mid)
+	}
 	e.evaluate(context.Background(), snapshot)
 }
 

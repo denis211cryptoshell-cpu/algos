@@ -102,7 +102,7 @@ func main() {
 	}
 
 	if *autoDetect {
-		go runListingDetector(ctx, client, exchangeName, engine, logger)
+		go runListingDetector(ctx, client, exchangeName, engine, cfg.Bot.MaxLeverage, logger)
 	}
 
 	if *dexMonitor {
@@ -126,10 +126,21 @@ func main() {
 	}
 
 	logger.Info("starting public market data", zap.Strings("symbols", symbols), zap.String("mode", cfg.Bot.Mode))
+	prepareSymbols(ctx, client, symbols, cfg.Bot.MaxLeverage, logger)
 	if err := client.ConnectPublic(ctx, symbols, engine); err != nil && ctx.Err() == nil {
 		logger.Fatal("public market data stopped", zap.Error(err))
 	}
 	orderManager.CloseAll(context.Background())
+}
+
+func prepareSymbols(ctx context.Context, client exchange.Client, symbols []string, leverage int, logger *zap.Logger) {
+	for _, symbol := range symbols {
+		warmCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		if err := client.PrepareSymbol(warmCtx, symbol, leverage); err != nil {
+			logger.Warn("prepare symbol failed", zap.String("symbol", symbol), zap.Error(err))
+		}
+		cancel()
+	}
 }
 
 func restoreOpenPositions(ctx context.Context, store *storage.BoltStore, orders *order.Manager, engine *app.Engine, notifier monitor.Notifier, logger *zap.Logger) {
@@ -170,7 +181,7 @@ func restoreOpenPositions(ctx context.Context, store *storage.BoltStore, orders 
 	}
 }
 
-func runListingDetector(ctx context.Context, client exchange.Client, exchangeName string, engine *app.Engine, logger *zap.Logger) {
+func runListingDetector(ctx context.Context, client exchange.Client, exchangeName string, engine *app.Engine, maxLeverage int, logger *zap.Logger) {
 	logger.Info("listing detector started, polling every 10s", zap.String("exchange", exchangeName))
 
 	known := make(map[string]bool)
@@ -220,6 +231,7 @@ func runListingDetector(ctx context.Context, client exchange.Client, exchangeNam
 		if err := client.SubscribeSymbols(newSymbols); err != nil {
 			logger.Warn("subscribe new symbols failed", zap.Error(err))
 		}
+		prepareSymbols(ctx, client, newSymbols, maxLeverage, logger)
 	}
 }
 
